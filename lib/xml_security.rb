@@ -36,12 +36,26 @@ module XMLSecurity
   class SignedDocument < REXML::Document
     C14N = "http://www.w3.org/2001/10/xml-exc-c14n#"
     DSIG = "http://www.w3.org/2000/09/xmldsig#"
+    ENC = "http://www.w3.org/2001/04/xmlenc#"
 
-    attr_accessor :signed_element_id
+    DEFAULT_CIPHER = "aes256"
+
+    attr_accessor :signed_element_id, :debug
 
     def initialize(response)
       super(response)
       extract_signed_element_id
+    end
+
+    def decrypt!(key, opts = {})
+      REXML::XPath.each(self, "//enc:EncryptedData", { "enc" => ENC }) do |data_element|
+        plain_text = decrypt_data(data_element, key, opts)
+        Rails.logger.info "SAML: decrypted data=#{plain_text}" if debug
+
+        encrypted_element = data_element.parent
+        decrypted_element = REXML::Element.new(plain_text)
+        encrypted_element.replace_with(decrypted_element)
+      end
     end
 
     def validate(idp_cert_fingerprint, soft = true)
@@ -76,9 +90,9 @@ module XMLSecurity
       # store and remove signature node
       @sig_element ||= begin
         element = REXML::XPath.first(@working_copy, "//ds:Signature", {"ds"=>DSIG})
-        element.remove
+        element.try(:remove)
       end
-
+      return true unless @sig_element
 
       # verify signature
       signed_info_element     = REXML::XPath.first(@sig_element, "//ds:SignedInfo", {"ds"=>DSIG})
@@ -124,6 +138,59 @@ module XMLSecurity
     end
 
     private
+
+    def decrypt_data(data_element, key, opts)
+      text = cipher_text(data_element)
+      Rails.logger.info "SAML: cipher text=#{text}" if debug
+      return nil unless text.present?
+
+      cipher = decryption_cipher(data_element, key, opts)
+      cipher.iv = text[0..cipher.iv_len]
+      cipher.update(text.slice(cipher.iv_len, text.length)) + cipher.final
+    end
+
+    def decryption_cipher(data_element, key, opts)
+      algorithm_name = nil
+      key_size = 0
+
+      if (encryption_method = REXML::XPath.first(data_element, "enc:EncryptionMethod", { "enc" => ENC }))
+        if (algorithm_element = encryption_method.attribute("Algorithm"))
+          if (name = algorithm_element.value) =~ /^#{ENC}/
+            algorithm_name = name.split("#")[1]
+            # Convert aesNNN-mode to aes-NNN-mode
+            algorithm_name.sub!(/^([a-z]+)/, "\\1-") if algorithm_name =~ /^[a-z]+[0-9]+-[a-z]/
+          end
+        end
+
+        if (key_size_element = encryption_method.attribute("KeySize"))
+          key_size = key_size_element.value.to_i
+        end
+
+        # TODO: Handle OAEPparams
+      end
+      algorithm_name ||= (opts[:algorithm] || DEFAULT_CIPHER)
+      Rails.logger.info "SAML: algorithm=#{algorithm_name}" if debug
+
+      cipher = OpenSSL::Cipher.new(algorithm_name)
+      cipher.decrypt
+      cipher.key = key
+      cipher.key_len = key_size if key_size > 0
+      cipher.padding = opts[:padding] if opts.include?(:padding)
+      cipher
+    end
+
+    def cipher_text(data_element)
+      Rails.logger.info "SAML: locating cipher text in #{data_element.to_s})" if debug
+      case
+        when cipher_value = REXML::XPath.first(data_element, "enc:CipherData/enc:CipherValue", { "enc" => ENC })
+          Base64.decode64(cipher_value.text)
+        when cipher_reference = REXML::XPath.first(data_element, "enc:CipherData/enc:CipherReference", { "enc" => ENC })
+          # TODO: Handle //CipherData/CipherReference
+          nil
+        else
+          nil
+        end
+    end
 
     def digests_match?(hash, digest_value)
       hash == digest_value

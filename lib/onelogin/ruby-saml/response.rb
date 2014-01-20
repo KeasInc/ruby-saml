@@ -21,8 +21,21 @@ module Onelogin
       def initialize(response, options = {})
         raise ArgumentError.new("Response cannot be nil") if response.nil?
         @options  = options
+
         @response = (response =~ /^</) ? response : Base64.decode64(response)
+        if @options[:debug]
+          Rails.logger.info "Onelogin::Saml: response=#{@response}"
+        end
+
         @document = XMLSecurity::SignedDocument.new(@response)
+        @document.debug = true if @options[:debug]
+        if @options[:debug]
+          Rails.logger.info "Onelogin::Saml: document=#{@document.to_s}"
+        end
+      end
+
+      def decrypt!(key)
+        @document.decrypt!(key)
       end
 
       def is_valid?
@@ -78,7 +91,7 @@ module Onelogin
           parse_time(node, "SessionNotOnOrAfter")
         end
       end
-      
+
       # Checks the status of the response for a "Success" code
       def success?
         @status_code ||= begin
@@ -118,7 +131,7 @@ module Onelogin
         validate_structure(soft)      &&
         validate_response_state(soft) &&
         validate_conditions(soft)     &&
-        document.validate(get_fingerprint, soft) && 
+        document.validate(get_fingerprint, soft) &&
         success?
       end
 
